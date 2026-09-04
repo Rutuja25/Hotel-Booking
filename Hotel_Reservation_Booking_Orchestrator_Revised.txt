@@ -1,0 +1,487 @@
+# Hotel Reservation System — Booking Orchestrator Service
+
+## 1. Responsibility
+
+The Booking Orchestrator owns the booking lifecycle.
+
+It coordinates:
+- Creating a booking
+- Locking room inventory
+- Initiating payment
+- Confirming the booking after successful payment
+- Releasing inventory on payment failure/timeout
+- Cancelling a confirmed booking
+- Recovering abandoned/inconsistent bookings
+
+The Booking Orchestrator is the source of truth for the **booking state**.
+Room Inventory Service is the source of truth for **room availability/reservation state**.
+
+---
+
+## 2. End-to-End Booking Flow
+
+1. Client requests a booking for a room type and date range.
+2. Booking Orchestrator creates a booking with `INITIATED`.
+3. Booking Orchestrator asks Room Inventory Service to lock the requested inventory.
+4. If inventory is successfully locked, booking moves to `INVENTORY_LOCKED`.
+5. Booking Orchestrator initiates payment and moves booking to `PAYMENT_PENDING`.
+6. Payment provider sends success/failure result.
+7. On payment success:
+   - Booking moves to `CONFIRMED`.
+   - Inventory Service converts the inventory from `BLOCKED` to `RESERVED`.
+8. On payment failure or payment timeout:
+   - Booking moves to `CANCELLED`.
+   - Inventory Service releases the blocked inventory.
+9. After the stay is completed, booking moves to `COMPLETED`.
+
+Important: booking state and inventory state are owned by different services, so the flow is **eventually consistent across services**. Idempotency and reconciliation are required.
+
+---
+
+## 3. State Machine
+
+### Booking states
+
+`INITIATED`
+→ `INVENTORY_LOCKED`
+→ `PAYMENT_PENDING`
+→ `CONFIRMED`
+→ `COMPLETED`
+
+Failure transitions:
+
+`INITIATED` → `CANCELLED`
+`INVENTORY_LOCKED` → `CANCELLED`
+`PAYMENT_PENDING` → `CANCELLED`
+
+### Meaning of each state
+
+| State | Meaning |
+|---|---|
+| INITIATED | Booking record exists, but inventory has not yet been successfully locked. |
+| INVENTORY_LOCKED | Requested inventory has been temporarily blocked for this booking. |
+| PAYMENT_PENDING | Inventory is blocked and the payment request is in progress. |
+| CONFIRMED | Payment succeeded and the inventory has been converted to reserved inventory. |
+| COMPLETED | Hotel stay has completed. |
+| CANCELLED | Booking will not proceed or was cancelled according to the supported cancellation policy. |
+
+### Important invariant
+
+A booking should never become `CONFIRMED` unless:
+1. Payment has succeeded, and
+2. The corresponding inventory reservation has been successfully established.
+
+The implementation must make the cross-service operation idempotent because there is no single database transaction spanning both services.
+
+---
+
+## 4. Requirements
+
+### User-facing READ
+
+1. Get booking by booking ID.
+2. Get bookings for a user.
+3. Search/select a room and start the booking flow.
+
+### User-facing WRITE
+
+1. Create/book a room.
+2. Cancel a confirmed booking.
+
+### Internal operations exposed by Booking Service
+
+1. Create booking.
+2. Update booking state.
+3. Record payment-related state/result.
+4. Support idempotent recovery/reconciliation.
+
+---
+
+## 5. APIs
+
+### Create Booking
+
+`POST /bookings`
+
+Request:
+```json
+{
+  "userId": "uuid",
+  "hotelId": "uuid",
+  "roomTypeId": "uuid",
+  "fromDate": "2026-10-10",
+  "toDate": "2026-10-13",
+  "quantity": 1
+}
+```
+
+Response:
+```json
+{
+  "bookingId": "uuid",
+  "status": "PAYMENT_PENDING",
+  "amount": 15000
+}
+```
+
+Use an idempotency key so a client retry does not create multiple bookings.
+
+### Get Booking
+
+`GET /bookings/{bookingId}`
+
+### Get User Bookings
+
+`GET /users/{userId}/bookings`
+
+Use pagination.
+
+### Cancel Booking
+
+`POST /bookings/{bookingId}/cancel`
+
+For simplicity, only `CONFIRMED` bookings are cancellable.
+
+---
+
+## 6. Core Data Model
+
+### Booking
+
+| Column | Type | Purpose |
+|---|---|---|
+| booking_id | UUID PK | Unique booking |
+| user_id | UUID | Customer |
+| hotel_id | UUID | Hotel |
+| room_type_id | UUID | Booked room type |
+| from_date | DATE | Check-in |
+| to_date | DATE | Check-out |
+| quantity | INT | Number of rooms |
+| booking_total | DECIMAL | Total booking amount |
+| status | VARCHAR/SMALLINT | Booking state |
+| payment_id | UUID nullable | Payment reference |
+| payment_expires_at | TIMESTAMP nullable | Payment deadline |
+| version | BIGINT | Optimistic concurrency |
+| created_at | TIMESTAMP | Creation time |
+| updated_at | TIMESTAMP | Last update |
+
+Use `DECIMAL` for money rather than `double`.
+
+---
+
+## 7. Access Patterns
+
+Primary access patterns:
+
+1. `booking_id` → one booking.
+2. `user_id + created_at` → user's bookings ordered by creation time.
+3. `status + payment_expires_at` → identify payment-pending bookings that have timed out.
+4. State transition by `booking_id + current_status + version`.
+
+---
+
+## 8. Indexes
+
+```sql
+PRIMARY KEY (booking_id)
+
+CREATE INDEX idx_booking_user_created
+ON booking (user_id, created_at DESC);
+
+CREATE INDEX idx_booking_payment_timeout
+ON booking (status, payment_expires_at);
+```
+
+The timeout index is useful for finding `PAYMENT_PENDING` bookings whose payment deadline has passed.
+
+---
+
+## 9. Concurrency Control
+
+There are two important concurrency problems.
+
+### A. Same booking updated concurrently
+
+Example:
+- User clicks Cancel twice.
+- Payment success arrives while timeout processing is running.
+- A retry sends the same state transition again.
+
+Use optimistic concurrency/state-transition checks.
+
+Example:
+
+```sql
+UPDATE booking
+SET status = :new_status,
+    version = version + 1,
+    updated_at = CURRENT_TIMESTAMP
+WHERE booking_id = :booking_id
+  AND status = :expected_old_status
+  AND version = :expected_version;
+```
+
+If affected rows = 0, the transition lost the race and must not be applied.
+
+### B. Multiple users competing for the same room inventory
+
+Booking Service must NOT decide availability itself.
+
+Room Inventory Service atomically locks inventory. See the Room Inventory design.
+
+---
+
+## 10. Preventing Invalid State Transitions
+
+Do not blindly execute:
+
+```sql
+UPDATE booking SET status = ?
+WHERE booking_id = ?;
+```
+
+Instead, define an allowed transition table in application logic:
+
+```text
+INITIATED          -> INVENTORY_LOCKED, CANCELLED
+INVENTORY_LOCKED   -> PAYMENT_PENDING, CANCELLED
+PAYMENT_PENDING    -> CONFIRMED, CANCELLED
+CONFIRMED          -> COMPLETED, CANCELLED
+COMPLETED          -> no normal transition
+CANCELLED          -> no normal transition
+```
+
+Then enforce the expected current state in the database using the conditional update.
+
+This protects against:
+- duplicate requests
+- stale workers
+- payment webhook retries
+- timeout worker racing with payment success
+- out-of-order messages
+
+---
+
+## 11. Payment Timeout
+
+When payment is initiated, store:
+
+`payment_expires_at = current_time + payment_timeout`
+
+For example, if the business chooses a 10-minute payment window, the booking becomes eligible for timeout after that deadline.
+
+A timeout worker periodically finds:
+
+```sql
+SELECT booking_id
+FROM booking
+WHERE status = 'PAYMENT_PENDING'
+  AND payment_expires_at < CURRENT_TIMESTAMP;
+```
+
+For every candidate it attempts:
+
+```text
+PAYMENT_PENDING -> CANCELLED
+```
+
+using the conditional state transition.
+
+If the payment provider later sends a success webhook, the webhook must also use an idempotent state transition.
+
+The race is therefore safe:
+
+- Timeout wins → booking is cancelled; successful payment must be handled according to the payment/refund policy.
+- Payment success wins → timeout worker sees that the booking is no longer `PAYMENT_PENDING` and does nothing.
+
+The exact payment/refund policy is a business decision.
+
+---
+
+## 12. Failure Handling
+
+### Inventory lock fails
+
+`INITIATED -> CANCELLED`
+
+No payment should be initiated.
+
+### Payment initiation fails
+
+`INVENTORY_LOCKED -> CANCELLED`
+
+Release blocked inventory.
+
+### Payment fails
+
+`PAYMENT_PENDING -> CANCELLED`
+
+Release blocked inventory.
+
+### Payment times out
+
+`PAYMENT_PENDING -> CANCELLED`
+
+Release blocked inventory.
+
+### Inventory reservation fails after payment success
+
+This is an important distributed-system failure.
+
+Do NOT simply mark the booking `CONFIRMED`.
+
+Use an intermediate/recovery mechanism such as:
+- retry reservation idempotently
+- reconciliation
+- payment refund/compensation if reservation cannot ultimately be established
+
+This is one reason the cross-service flow should be treated as a saga rather than a distributed transaction.
+
+---
+
+## 13. Idempotency
+
+Every external operation that can be retried must be idempotent.
+
+Examples:
+
+### Create booking
+
+Client supplies an idempotency key.
+
+### Lock inventory
+
+Use `booking_id` as the idempotency/reference key so the same booking cannot create multiple locks.
+
+### Payment webhook
+
+Payment provider's payment/event ID should be stored and processed only once.
+
+### Reserve/release inventory
+
+Operations should be safe to repeat for the same `booking_id`.
+
+---
+
+## 14. Reconciler
+
+A reconciler handles cases where one service succeeds and the other does not receive/process the result.
+
+Examples:
+
+### Case 1
+Booking = `PAYMENT_PENDING`
+Payment provider says SUCCESS
+But confirmation processing failed.
+
+Reconciler finds the payment success and completes the booking flow.
+
+### Case 2
+Booking = `CANCELLED`
+Inventory is still BLOCKED.
+
+Reconciler asks Inventory Service to release the inventory.
+
+### Case 3
+Booking = `CONFIRMED`
+Inventory reservation was not completed.
+
+Reconciler retries the reservation or starts the compensation/refund workflow.
+
+The reconciler should be idempotent and should not blindly overwrite state.
+
+---
+
+## 15. Historical Data
+
+Active bookings are kept in the primary operational database.
+
+Old/completed bookings can eventually be moved to a historical store if scale requires it.
+
+Do not move data simply because it is old. Define a retention policy based on:
+- query requirements
+- compliance
+- storage cost
+- operational performance
+
+---
+
+## 16. Database Decision — Why SQL?
+
+### Requirements driving the decision
+
+The Booking database needs:
+
+1. Strong consistency for booking state.
+2. Conditional state transitions.
+3. Optimistic concurrency/version checks.
+4. Transactions for changes within the Booking Service.
+5. Multiple query patterns:
+   - by booking ID
+   - by user ID
+   - by payment timeout
+6. Moderate write/update volume for active bookings.
+7. Clear relational relationships between booking, payment references and reservation metadata.
+
+A relational database such as PostgreSQL is therefore a strong default.
+
+### Why not Cassandra?
+
+Cassandra is excellent when we have:
+- very large write volume
+- predictable access patterns
+- horizontal scale requirements
+- availability over cross-record transactional consistency
+
+But Booking Service has correctness-sensitive state transitions and concurrency rules. SQL gives us:
+- transactions
+- conditional updates
+- mature optimistic locking
+- constraints
+- flexible querying
+- strong consistency semantics
+
+Therefore, SQL is not chosen because "SQL is always better." It is chosen because the **booking invariants and concurrency requirements fit SQL well**.
+
+If the scale or access pattern changed substantially, the database decision should be revisited.
+
+---
+
+## 17. Important Architectural Boundary
+
+Booking Service owns:
+
+```text
+Booking lifecycle
+Payment state/reference
+Booking APIs
+Booking consistency
+```
+
+Room Inventory Service owns:
+
+```text
+Available room count
+Blocked inventory
+Reserved inventory
+Inventory concurrency
+```
+
+Do not update `room_inventory` directly from Booking Service.
+
+---
+
+## 18. Key Interview Discussion Points
+
+Be prepared to explain:
+
+1. Why inventory is locked before payment.
+2. Why we need `BLOCKED` and `RESERVED` as separate inventory states.
+3. Why booking and inventory cannot use one distributed transaction.
+4. How optimistic concurrency prevents two workers from applying conflicting state transitions.
+5. How payment timeout is detected.
+6. What happens when payment succeeds but inventory reservation fails.
+7. How duplicate payment webhooks are handled.
+8. Why SQL fits booking state management.
+9. Why Cassandra is not automatically the right choice just because the system may become large.
+10. Why reconciliation is required in a distributed booking workflow.

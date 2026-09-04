@@ -1,0 +1,559 @@
+# Hotel Reservation System — Room Inventory Service
+
+## 1. Responsibility
+
+Room Inventory Service is the source of truth for room availability.
+
+It owns:
+- Total room inventory
+- Available rooms
+- Temporarily blocked rooms
+- Confirmed reserved rooms
+- Inventory concurrency
+- Reservation lifecycle for a booking
+
+Booking Service must not directly modify the inventory database.
+
+---
+
+## 2. Inventory Model
+
+Suppose a hotel has 10 Deluxe rooms.
+
+For a particular date:
+
+```text
+total_rooms    = 10
+available      = 7
+blocked        = 1
+reserved       = 2
+```
+
+Invariant:
+
+```text
+total_rooms = available_rooms + blocked_rooms + reserved_rooms
+```
+
+This invariant should hold for every hotel + room type + date.
+
+---
+
+## 3. Why Inventory Is Stored Per Date
+
+A hotel booking spans multiple dates.
+
+For example:
+
+```text
+Check-in  : Oct 10
+Check-out : Oct 13
+```
+
+The room is needed for:
+
+```text
+Oct 10
+Oct 11
+Oct 12
+```
+
+Therefore, inventory is represented per:
+
+```text
+hotel_id + room_type_id + date
+```
+
+The checkout date is normally not consumed as a room-night.
+
+---
+
+## 4. Booking Inventory Flow
+
+### Step 1 — Lock
+
+Booking Service asks:
+
+```text
+Lock inventory
+hotel = H1
+room type = Deluxe
+dates = Oct 10–12
+quantity = 1
+booking = B1
+```
+
+Inventory Service atomically verifies availability for every required date.
+
+If all dates have enough availability:
+
+```text
+available_rooms -= quantity
+blocked_rooms   += quantity
+```
+
+and creates a reservation record with:
+
+```text
+status = BLOCKED
+```
+
+The operation succeeds only if all required dates can be locked.
+
+Do not partially lock some dates and fail others without compensation/rollback.
+
+---
+
+## 5. Inventory State Machine
+
+```text
+BLOCKED
+   |
+   | payment success
+   v
+RESERVED
+   |
+   | booking cancelled
+   v
+RELEASED
+```
+
+Failure path:
+
+```text
+BLOCKED -> RELEASED
+```
+
+Meaning:
+
+| State | Meaning |
+|---|---|
+| BLOCKED | Temporarily held for a booking while payment is pending. |
+| RESERVED | Payment succeeded and inventory is committed to the booking. |
+| RELEASED | Inventory was returned and cannot be reused by this reservation. |
+
+---
+
+## 6. Core Data Model
+
+### room_inventory
+
+```text
+hotel_id
+room_type_id
+date
+total_rooms
+available_rooms
+blocked_rooms
+reserved_rooms
+version
+```
+
+Primary key:
+
+```text
+(hotel_id, room_type_id, date)
+```
+
+The combination uniquely identifies inventory for one room type on one date.
+
+### reservation
+
+```text
+reservation_id
+booking_id
+hotel_id
+room_type_id
+from_date
+to_date
+quantity
+status
+created_at
+updated_at
+```
+
+Important: store the date range or enough information to reconstruct exactly which inventory rows belong to the reservation.
+
+---
+
+## 7. Access Patterns
+
+Primary operations:
+
+1. Check availability for a hotel + room type + date range.
+2. Lock inventory for a booking across a date range.
+3. Convert blocked inventory to reserved.
+4. Release blocked inventory.
+5. Recover inconsistent reservations.
+6. Read reservation by booking ID.
+
+---
+
+## 8. APIs
+
+### Check Availability
+
+`GET /hotels/{hotelId}/room-types/{roomTypeId}/availability?fromDate=...&toDate=...`
+
+### Lock Inventory
+
+`POST /inventory/locks`
+
+Request:
+
+```json
+{
+  "bookingId": "uuid",
+  "hotelId": "uuid",
+  "roomTypeId": "uuid",
+  "fromDate": "2026-10-10",
+  "toDate": "2026-10-13",
+  "quantity": 1
+}
+```
+
+### Reserve Inventory
+
+`POST /inventory/reservations`
+
+Use `bookingId` as the idempotency/reference key.
+
+### Release Inventory
+
+`POST /inventory/releases`
+
+Also idempotent using `bookingId`.
+
+---
+
+## 9. Data-Level Concurrency
+
+The important race is:
+
+```text
+User A wants 1 room
+User B wants 1 room
+Only 1 room is available
+```
+
+Both requests must not succeed.
+
+Use an atomic conditional update.
+
+For one inventory date:
+
+```sql
+UPDATE room_inventory
+SET available_rooms = available_rooms - :quantity,
+    blocked_rooms = blocked_rooms + :quantity,
+    version = version + 1
+WHERE hotel_id = :hotel_id
+  AND room_type_id = :room_type_id
+  AND date = :date
+  AND available_rooms >= :quantity;
+```
+
+If the update affects zero rows, sufficient inventory was not available.
+
+### Version check
+
+If optimistic concurrency using `version` is selected:
+
+```sql
+UPDATE room_inventory
+SET available_rooms = available_rooms - :quantity,
+    blocked_rooms = blocked_rooms + :quantity,
+    version = version + 1
+WHERE hotel_id = :hotel_id
+  AND room_type_id = :room_type_id
+  AND date = :date
+  AND available_rooms >= :quantity
+  AND version = :expected_version;
+```
+
+The exact concurrency mechanism should be chosen based on contention and transaction design. The key requirement is that the availability check and inventory decrement are atomic.
+
+---
+
+## 10. Multi-Day Booking
+
+For a booking from Oct 10 to Oct 13, the system needs to lock:
+
+```text
+Oct 10
+Oct 11
+Oct 12
+```
+
+All rows must be successfully updated.
+
+Recommended approach:
+
+1. Start DB transaction.
+2. Read/lock all required inventory rows in a deterministic date order.
+3. Verify availability for every date.
+4. Update all rows.
+5. Insert reservation with `BLOCKED`.
+6. Commit.
+
+If any date has insufficient inventory:
+
+```text
+rollback
+```
+
+No partial lock should remain.
+
+Deterministic ordering helps reduce deadlock risk when multiple bookings span overlapping dates.
+
+---
+
+## 11. Reservation State Transitions
+
+### Lock
+
+```text
+BLOCKED
+```
+
+Inventory effect:
+
+```text
+available -= quantity
+blocked   += quantity
+```
+
+### Payment Success
+
+```text
+BLOCKED -> RESERVED
+```
+
+Inventory effect:
+
+```text
+blocked   -= quantity
+reserved  += quantity
+```
+
+### Payment Failure / Timeout
+
+```text
+BLOCKED -> RELEASED
+```
+
+Inventory effect:
+
+```text
+blocked   -= quantity
+available += quantity
+```
+
+### Cancellation after confirmation
+
+```text
+RESERVED -> RELEASED
+```
+
+Inventory effect:
+
+```text
+reserved  -= quantity
+available += quantity
+```
+
+This cancellation transition is only allowed according to the booking cancellation policy.
+
+---
+
+## 12. Preventing Duplicate State Updates
+
+Never do:
+
+```sql
+UPDATE reservation
+SET status = :new_status
+WHERE reservation_id = :id;
+```
+
+Instead:
+
+```sql
+UPDATE reservation
+SET status = :new_status,
+    version = version + 1,
+    updated_at = CURRENT_TIMESTAMP
+WHERE reservation_id = :id
+  AND status = :expected_old_status
+  AND version = :expected_version;
+```
+
+This prevents:
+
+- duplicate release
+- duplicate reservation
+- stale worker updates
+- payment/timeout races
+
+---
+
+## 13. Idempotency
+
+Inventory operations are retried in distributed systems.
+
+Therefore:
+
+```text
+booking_id
+```
+
+should be the business idempotency key for a booking's inventory operation.
+
+Examples:
+
+### Duplicate LOCK
+
+If the booking already has a BLOCKED reservation, return the existing result rather than blocking inventory again.
+
+### Duplicate RESERVE
+
+If already RESERVED, return success without incrementing reserved inventory again.
+
+### Duplicate RELEASE
+
+If already RELEASED, return success without changing counts again.
+
+This is critical because retries are expected, not exceptional.
+
+---
+
+## 14. Database Decision — Why SQL?
+
+Room inventory has a strong invariant:
+
+```text
+total = available + blocked + reserved
+```
+
+More importantly, booking correctness depends on atomic operations such as:
+
+```text
+check available >= quantity
+AND
+decrement available
+AND
+increment blocked
+```
+
+These operations are naturally represented using SQL transactions and conditional updates.
+
+SQL also provides:
+- transactions
+- row-level locking/optimistic concurrency
+- primary-key uniqueness
+- constraints
+- predictable range queries by hotel/room type/date
+
+Therefore PostgreSQL is a strong default.
+
+### Why not Cassandra?
+
+Cassandra can scale horizontally and is excellent for high-volume, predictable workloads.
+
+However, the critical inventory operation is a **conditional state-changing operation with correctness invariants**. We should not choose Cassandra merely because availability/search traffic may be large.
+
+If the system later reaches a scale where SQL inventory becomes the bottleneck, we can consider specialized inventory architectures. The database decision should follow measured workload and consistency requirements.
+
+---
+
+## 15. Indexes
+
+Primary key:
+
+```sql
+PRIMARY KEY (hotel_id, room_type_id, date)
+```
+
+Reservation lookup:
+
+```sql
+CREATE UNIQUE INDEX idx_reservation_booking
+ON reservation (booking_id);
+```
+
+Optional operational index:
+
+```sql
+CREATE INDEX idx_reservation_status
+ON reservation (status, updated_at);
+```
+
+The original `index_on_user_id` does not belong here because Room Inventory Service does not own user-level booking queries.
+
+---
+
+## 16. Reconciler
+
+The reconciler handles cross-service failures.
+
+### Case 1
+
+Booking is `CANCELLED`, but reservation is still `BLOCKED`.
+
+Action:
+
+```text
+BLOCKED -> RELEASED
+```
+
+### Case 2
+
+Booking is `CONFIRMED`, but reservation is still `BLOCKED`.
+
+Action:
+
+```text
+BLOCKED -> RESERVED
+```
+
+provided payment confirmation is authoritative.
+
+### Case 3
+
+Reservation exists but corresponding booking cannot be found or is permanently abandoned.
+
+Do not immediately delete it. Mark/recover it according to a defined reconciliation policy.
+
+The reconciler must use the same idempotent state-transition logic as normal requests.
+
+---
+
+## 17. Historical Data
+
+Active inventory is operational data.
+
+Historical reservation records can be archived when they are no longer needed for operational queries.
+
+Do not introduce Cassandra only because historical data is large. Choose the historical store separately based on:
+- retention
+- query patterns
+- cost
+- scale
+- analytics requirements
+
+---
+
+## 18. Key Interview Discussion Points
+
+Be prepared to explain:
+
+1. Why inventory is maintained per room type and date.
+2. Why `BLOCKED` and `RESERVED` are separate.
+3. How two users competing for the last room are handled.
+4. How a multi-day booking is locked atomically.
+5. How duplicate lock/reserve/release requests are handled.
+6. Why Booking Service cannot directly modify inventory.
+7. What happens when payment succeeds but the reserve call fails.
+8. How cancellation releases inventory.
+9. Why SQL is selected without assuming SQL is always the answer.
+10. Why reconciliation is necessary.
